@@ -18,8 +18,10 @@ import threading
 import asyncio
 import socket
 import struct
+import errno
 import math
 import os
+import time
 from typing import List
 from mathutils import Vector, Quaternion, Matrix
 from . import properties
@@ -48,6 +50,7 @@ class Avatar:
         self.thread: threading.Thread = None
 
         self.last_data: MocopiData = None
+        self.last_packet_time: float = 0.0
         self.base_location: Vector = None
         self.updating: bool = False
 
@@ -65,12 +68,27 @@ class Avatar:
 
     # Public
 
+    def __get_scene(self) -> bpy.types.Scene:
+        scene = bpy.context.scene
+        if scene:
+            return scene
+        if bpy.data.scenes:
+            return bpy.data.scenes[0]
+        return None
+
     def update(self):
 
-        if not self.running or not self.last_data:
+        if not self.running:
             return
 
-        prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(self.id)
+        if not self.last_data:
+            return
+
+        scene = self.__get_scene()
+        if not scene or not hasattr(scene, 'mocopi_property'):
+            return
+
+        prop: properties.MocopiAvatarProperty = scene.mocopi_property.get(self.id)
         if not utils.is_valid(prop) or not utils.is_valid(self.rig):
             return
         
@@ -78,6 +96,7 @@ class Avatar:
         if self.is_recording and (not self.rig.animation_data or not self.rig.animation_data.action):
             action_data = self.rig.animation_data_create()
             action_data.action = bpy.data.actions.new(name='mocopi_action')
+            utils.ensure_action_slot(action_data)
         
         if prop.mode == 'v1':
         
@@ -99,6 +118,10 @@ class Avatar:
             for bone_id in range(MocopiData.MAX_BONE):
                 self.__bone_update(bone_id, self.rig , mode='v2')
 
+            view_layer = getattr(bpy.context, 'view_layer', None)
+            if view_layer:
+                view_layer.update()
+
             # アクション
             if self.is_recording:
                 self.__action_update(self.skeleton)
@@ -107,16 +130,29 @@ class Avatar:
 
     def retarget(self, rig: bpy.types.Object, prop: properties.MocopiAvatarProperty = None):
         self.rig = rig
+
+        # v2 実行中は panel draw / timer sync で retarget() が再入しても、
+        # 更新先を target rig に戻さず mocopiSkeleton を維持する。
+        if self.running and prop and prop.mode == 'v2' and utils.is_armature(self.skeleton):
+            self.__set_bone_data_list(self.skeleton)
+            return
+
         self.__set_bone_data_list(rig, prop)
 
     def run(self):
 
-        prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(self.id)
+        scene = self.__get_scene()
+        if not scene or not hasattr(scene, 'mocopi_property'):
+            return
+
+        prop: properties.MocopiAvatarProperty = scene.mocopi_property.get(self.id)
         if not utils.is_valid(prop) or not utils.is_armature(self.rig):
             return
 
         self.running = True
         self.base_location = None
+        self.last_data = None
+        self.last_packet_time = 0.0
 
         if prop.mode == 'v1':
 
@@ -152,13 +188,16 @@ class Avatar:
             self.rig.select_set(False)
             self.skeleton.select_set(False)
 
-            # スケルトンを非表示
+            # 実行中は操作対象から外しつつ非表示にする
             self.skeleton.hide_set(True)
+            self.skeleton.hide_select = True
+            self.skeleton.display_type = 'WIRE'
 
         asyncio.run(self.__run())
         
     def stop(self):
         self.running = False
+        self.last_data = None
 
         if self.udp_socket:
             self.udp_socket.close()
@@ -168,8 +207,9 @@ class Avatar:
             self.thread.join()
         self.thread = None
 
-        prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(self.id)
-        if prop.mode == 'v2':
+        scene = self.__get_scene()
+        prop = scene.mocopi_property.get(self.id) if scene and hasattr(scene, 'mocopi_property') else None
+        if utils.is_valid(prop) and prop.mode == 'v2':
             self.__bake_retarget_reset(prop, self.skeleton, self.rig)
             #self.rig.rotation_quaternion = self.t_base_quaternion.copy()
 
@@ -186,7 +226,11 @@ class Avatar:
         
         self.is_recording = False
 
-        prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(self.id)
+        scene = self.__get_scene()
+        if not scene or not hasattr(scene, 'mocopi_property'):
+            return
+
+        prop: properties.MocopiAvatarProperty = scene.mocopi_property.get(self.id)
         self.__bake_animation(prop, self.skeleton, self.rig)
 
     def has_animation(self):
@@ -206,18 +250,26 @@ class Avatar:
 
         action_data = skeleton.animation_data_create()
         action_data.action = bpy.data.actions.new(name=f"mocopiAction")
+        utils.ensure_action_slot(action_data)
         return skeleton
 
     async def __run(self):
 
-        prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(self.id)
+        scene = self.__get_scene()
+        if not scene or not hasattr(scene, 'mocopi_property'):
+            return
+
+        prop: properties.MocopiAvatarProperty = scene.mocopi_property.get(self.id)
         if not utils.is_valid(prop):
             return
 
         try:
             self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+            # 同一PCプロセス(127.0.0.1)送信も受けるため全IFで待受する
             self.udp_socket.bind(('', prop.port))
             self.udp_socket.settimeout(5)
+            print(f"mocopi_receiver: UDP listening (avatar={self.id}, port={prop.port})")
 
             self.thread = threading.Thread(target=self.__listen)
             self.thread.daemon = True
@@ -228,17 +280,35 @@ class Avatar:
     def __listen(self):
         while self.running:
             try:
-                data, _ = self.udp_socket.recvfrom(4096) # 1024, 4096
-                if data and not self.updating:
-                    self.last_data = MocopiData(data)
+                data, addr = self.udp_socket.recvfrom(4096) # 1024, 4096
+                if data:
+                    parsed = MocopiData(data)
+                    if parsed.packet_type == 'frame':
+                        self.last_data = parsed
+                        self.last_packet_time = time.time()
+                    elif parsed.packet_type == 'skeleton':
+                        continue
             except socket.timeout:
-                print("Error occurred: socket.timeout")
+                continue
+            except OSError as e:
+                # stop() 後の socket close に伴う想定内エラーは無視
+                if not self.running and getattr(e, 'winerror', None) == 10038:
+                    break
+                if not self.running and getattr(e, 'errno', None) in (errno.EBADF, errno.ENOTSOCK):
+                    break
+                print(f"Error occurred: {e}")
+            except (struct.error, UnicodeDecodeError, ValueError):
+                continue
             except Exception as e:
                 print(f"Error occurred: {e}")
     
     def __bone_update(self, bone_id: int, target_armature: bpy.types.Object, mode: str):
 
-        prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(self.id)
+        scene = self.__get_scene()
+        if not scene or not hasattr(scene, 'mocopi_property'):
+            return
+
+        prop: properties.MocopiAvatarProperty = scene.mocopi_property.get(self.id)
         if not utils.is_valid(prop):
             return
         
@@ -327,7 +397,11 @@ class Avatar:
         if not rig.animation_data or not rig.animation_data.action:
             return
 
-        scene = bpy.context.scene
+        utils.ensure_action_slot(rig.animation_data)
+
+        scene = self.__get_scene()
+        if not scene:
+            return
         frame = scene.frame_current
 
         for bone_id in range(MocopiData.MAX_BONE):
@@ -387,19 +461,23 @@ class Avatar:
         source_armature.rotation_quaternion = self.t_base_quaternion 
 
 
-        bpy.context.view_layer.objects.active = target_armature
-        bpy.ops.object.mode_set(mode='EDIT')
+        if not utils.ensure_object_mode(target_armature, 'EDIT'):
+            return
 
         # ヒップの向き補正計算
-        source_hip_edit_bone = source_armature.data.edit_bones.get(utils.bone_id_to_bone_name(0))
-        source_forward = (source_hip_edit_bone.tail - source_hip_edit_bone.head).normalized()
+        source_hip_bone = source_armature.data.bones.get(utils.bone_id_to_bone_name(0))
+        if not source_hip_bone:
+            return
+        source_forward = (source_hip_bone.tail_local - source_hip_bone.head_local).normalized()
         target_hip_edit_bone = target_armature.data.edit_bones.get(prop.get_bone(0))
+        if not target_hip_edit_bone:
+            return
         target_forward = (target_hip_edit_bone.tail - target_hip_edit_bone.head).normalized()
         hip_rotation = source_forward.rotation_difference(target_forward)
         self.retarget_base_rotation = hip_rotation
 
-        bpy.context.view_layer.objects.active = source_armature
-        bpy.ops.object.mode_set(mode='EDIT')
+        if not utils.ensure_object_mode(source_armature, 'EDIT'):
+            return
 
         # source_armatureのボーンを再計算 
         bone_update_list = {}
@@ -436,6 +514,8 @@ class Avatar:
                     'roll': utils.mat3_to_vec_roll(hip_align.to_matrix() @ source_edit_bone.matrix.to_3x3())
                 }
 
+        pending_constraints = []
+
         # 擬似ボーンの生成
         for bone_id in range(MocopiData.MAX_BONE):
 
@@ -443,7 +523,7 @@ class Avatar:
             source_bone = source_armature.pose.bones.get(source_bone_name)
             source_edit_bone = source_armature.data.edit_bones.get(source_bone_name)
 
-            if source_edit_bone is None or bone_update_list[bone_id] is None:
+            if source_edit_bone is None or bone_id not in bone_update_list:
                 continue
 
             source_edit_bone.head = bone_update_list[bone_id]['head']
@@ -454,8 +534,9 @@ class Avatar:
             if not target_bone_name:
                 continue
 
-            target_bone = target_armature.pose.bones.get(target_bone_name)
             target_edit_bone = target_armature.data.edit_bones.get(target_bone_name) 
+            if not target_edit_bone:
+                continue
 
             new_source_edit_bone_name = target_bone_name
             if source_bone_name == new_source_edit_bone_name:
@@ -478,37 +559,56 @@ class Avatar:
                 (source_armature.matrix_world.inverted().to_3x3() @ target_armature.matrix_world.to_3x3()) @ target_edit_bone.matrix.to_3x3()
             )
 
-            if target_bone.constraints:
-                for constraint in filter(lambda c: c.type == 'COPY_LOCATION' or c.type == 'COPY_ROTATION', target_bone.constraints):
+            pending_constraints.append((bone_id, target_bone_name, new_source_edit_bone_name))
+
+
+        if not utils.ensure_object_mode(source_armature, 'OBJECT'):
+            return
+
+        if not utils.ensure_object_mode(target_armature, 'POSE'):
+            return
+
+        for bone_id, target_bone_name, subtarget_name in pending_constraints:
+            target_bone = target_armature.pose.bones.get(target_bone_name)
+            source_pose_bone = source_armature.pose.bones.get(subtarget_name)
+            if not target_bone or not source_pose_bone:
+                continue
+
+            for constraint in list(target_bone.constraints):
+                if constraint.name in {'mocopi_copy_location', 'mocopi_copy_rotation'}:
                     target_bone.constraints.remove(constraint)
 
             if bone_id == 0:
                 constraint = target_bone.constraints.new('COPY_LOCATION')
+                constraint.name = 'mocopi_copy_location'
                 constraint.target = source_armature
-                constraint.subtarget = target_bone_name
+                constraint.subtarget = subtarget_name
                 constraint.target_space = 'WORLD'
                 constraint.owner_space = 'WORLD'
 
             constraint = target_bone.constraints.new('COPY_ROTATION')
+            constraint.name = 'mocopi_copy_rotation'
             constraint.target = source_armature
-            constraint.subtarget = target_bone_name
+            constraint.subtarget = subtarget_name
             constraint.target_space = 'POSE'
             constraint.owner_space = 'POSE'
 
+        if not utils.ensure_object_mode(source_armature, 'OBJECT'):
+            return
 
-        # Transformの同期
-        constraint = source_armature.constraints.get("Copy Location")
-        constraint = source_armature.constraints.new(type='COPY_LOCATION')
-        constraint.target = target_armature
+        # 初期Transformだけ合わせ、常時のオブジェクト制約は張らない。
+        # ターゲット骨 -> source骨 と sourceオブジェクト -> targetオブジェクト を同時に張ると
+        # Blender 4.5 で評価循環になり、停止時だけ1フレーム見える状態になりやすい。
+        for constraint in list(source_armature.constraints):
+            if constraint.name in {'mocopi_obj_copy_location', 'mocopi_obj_copy_rotation'}:
+                source_armature.constraints.remove(constraint)
 
-        constraint = source_armature.constraints.new(type='COPY_ROTATION')
-        constraint.target = target_armature
-        constraint.use_offset = False
-        
-        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.context.view_layer.update()
         bpy.ops.object.select_all(action='DESELECT')
 
         source_armature.hide_set(True)
+        source_armature.hide_select = True
+        source_armature.display_type = 'WIRE'
         source_armature.select_set(False)
         target_armature.hide_set(False)
         target_armature.select_set(False)
@@ -517,6 +617,9 @@ class Avatar:
 
         target_armature.rotation_quaternion = self.t_base_quaternion.copy()
 
+        if not utils.ensure_object_mode(source_armature, 'EDIT'):
+            return
+
         for bone_id in range(MocopiData.MAX_BONE):
 
             target_bone_name = prop.get_bone(bone_id)
@@ -524,18 +627,31 @@ class Avatar:
                 continue
             target_bone = target_armature.pose.bones.get(target_bone_name)
 
-            new_source_edit_bone = source_armature.data.edit_bones.get(target_bone_name) 
-            if new_source_edit_bone:
-                source_armature.data.edit_bones.remove(new_source_edit_bone) 
+            for subtarget_name in (target_bone_name, f"_{target_bone_name}"):
+                new_source_edit_bone = source_armature.data.edit_bones.get(subtarget_name)
+                if new_source_edit_bone:
+                    source_armature.data.edit_bones.remove(new_source_edit_bone)
             
             if target_bone.constraints:
-                for constraint in filter(lambda c: c.type == 'COPY_LOCATION' or c.type == 'COPY_ROTATION', target_bone.constraints):
-                    target_bone.constraints.remove(constraint)
+                for constraint in list(target_bone.constraints):
+                    if constraint.name in {'mocopi_copy_location', 'mocopi_copy_rotation'}:
+                        target_bone.constraints.remove(constraint)
+
+        for constraint in list(source_armature.constraints):
+            if constraint.name in {'mocopi_obj_copy_location', 'mocopi_obj_copy_rotation'}:
+                source_armature.constraints.remove(constraint)
+
+        utils.ensure_object_mode(target_armature, 'OBJECT')
+        bpy.context.view_layer.update()
 
     # Bake
     def __bake_animation(self, prop: properties.MocopiAvatarProperty, source_armature: bpy.types.Object, target_armature: bpy.types.Object):
 
-        if len(self.skeleton.animation_data.action.fcurves) == 0 or not prop.root:
+        if not prop.root:
+            return
+
+        frame_start, frame_end = utils.read_anim_start_end(self.skeleton)
+        if frame_start is None or frame_end is None:
             return
 
         target_armature.rotation_quaternion = self.t_base_quaternion.copy()
@@ -550,8 +666,8 @@ class Avatar:
             'use_connect': False,
         }
 
-        bpy.context.view_layer.objects.active = source_armature
-        bpy.ops.object.mode_set(mode='EDIT')
+        if not utils.ensure_object_mode(source_armature, 'EDIT'):
+            return
 
         hip_target_bone_name = prop.get_bone(0)
         hip_target_edit_bone = target_armature.data.edit_bones.get(hip_target_bone_name)
@@ -559,21 +675,23 @@ class Avatar:
         hip_target_edit_bone.use_connect = False
 
         # アニメーションのベイク
-        bpy.ops.object.mode_set(mode='OBJECT')
+        if not utils.ensure_object_mode(source_armature, 'OBJECT'):
+            return
         bpy.ops.object.select_all(action='DESELECT')
         
         # ベイク実行
         utils.bake_animation(self.skeleton, target_armature, target_bone_name_list=prop.get_bone_list())
 
         # Default（リセット）
-        bpy.context.view_layer.objects.active = target_armature
-
-        bpy.ops.object.mode_set(mode='EDIT')
+        if not utils.ensure_object_mode(target_armature, 'EDIT'):
+            return
 
         hip_target_edit_bone = target_armature.data.edit_bones.get(hip_target_bone_name)
         hip_target_edit_bone.use_connect = defaults['use_connect']
 
-        bpy.ops.object.mode_set(mode='OBJECT')
+        if not utils.ensure_object_mode(target_armature, 'OBJECT'):
+            return
+        bpy.context.view_layer.update()
         bpy.ops.object.select_all(action='DESELECT')
         source_armature.hide_set(True)
         source_armature.select_set(False)
@@ -979,8 +1097,9 @@ class MocopiData:
         self.sndf = {}
         self.fram = {}
         self.btrs = {}
+        self.packet_type: str = 'unknown'
 
-        self.__init(data)
+        self.__parse_packet(data)
 
     def get_tran(self, bone_id: int) -> list[float]:
         # return self.btrs['btdt'][bone_id]['tran']['data']
@@ -988,132 +1107,223 @@ class MocopiData:
         btdt = next((btdt for btdt in self.btrs['btdt'] if btdt['bnid']['data'] == bone_id), None)
         return btdt['tran']['data'] if btdt else None
 
-    def __init(self, data):
-        
-        i = 0
+    def __parse_packet(self, packet: bytes):
 
-        # head
-        head = self.__parse(data, i)
-        i = head['end']
+        packet_len = len(packet)
+        if packet_len < 8:
+            raise ValueError('packet too short')
 
-        # head > ftyp
-        ftyp = self.__parse(data, i, 'ascii')
-        i = ftyp['end']
+        head = self.__find_child(packet, 0, packet_len, 'head')
+        if not head:
+            raise ValueError('missing head chunk')
 
-        # head > vrsn
-        vrsn = self.__parse(data, i, 'int')
-        i = vrsn['end']
+        self.head = self.__chunk_to_dict(head)
 
-        self.head = head
-        self.head['ftyp'] = ftyp
-        self.head['vrsn'] = vrsn
+        ftyp = self.__find_child(packet, head['payload_start'], head['payload_end'], 'ftyp')
+        if ftyp:
+            self.head['ftyp'] = self.__chunk_to_dict(ftyp, self.__read_ascii(packet, ftyp))
 
-        # sndf
-        sndf = self.__parse(data, i)
-        i = sndf['end']
+        vrsn = self.__find_child(packet, head['payload_start'], head['payload_end'], 'vrsn')
+        if vrsn:
+            self.head['vrsn'] = self.__chunk_to_dict(vrsn, self.__read_int(packet, vrsn))
 
-        # sndf > ipad
-        ipad = self.__parse(data, i, 'raw')
-        i = ipad['end']
+        sndf = self.__find_child(packet, 0, packet_len, 'sndf')
+        if sndf:
+            self.sndf = self.__chunk_to_dict(sndf)
+            ipad = self.__find_child(packet, sndf['payload_start'], sndf['payload_end'], 'ipad')
+            if ipad:
+                self.sndf['ipad'] = self.__chunk_to_dict(ipad, self.__read_raw(packet, ipad))
+            rcvp = self.__find_child(packet, sndf['payload_start'], sndf['payload_end'], 'rcvp')
+            if rcvp:
+                self.sndf['rcvp'] = self.__chunk_to_dict(rcvp, self.__read_raw(packet, rcvp))
 
-        # sndf > rcvp
-        rcvp = self.__parse(data, i, 'raw')
-        i = rcvp['end']
+        fram = self.__find_child(packet, 0, packet_len, 'fram')
+        if fram:
+            self.fram = self.__chunk_to_dict(fram)
+            for key in ('fnum', 'time', 'uttm', 'tmcd'):
+                child = self.__find_child(packet, fram['payload_start'], fram['payload_end'], key)
+                if child:
+                    self.fram[key] = self.__chunk_to_dict(child, self.__read_int(packet, child))
 
-        self.sndf = sndf
-        self.sndf['ipad'] = ipad
-        self.sndf['rcvp'] = rcvp
+        btrs = self.__find_child(packet, 0, packet_len, 'btrs')
+        skdf = self.__find_child(packet, 0, packet_len, 'skdf')
 
-        # fram
-        fram = self.__parse(data, i)
-        if fram['name'] == 'fram':
-            i = fram['end']
-            self.fram = fram
+        # frame は fram / btrs 系チャンクを持つものだけを許可する
+        has_frame_container = bool(fram or btrs)
 
-        # fram > fnum
-        fnum = self.__parse(data, i, 'int')
-        if fnum['name'] == 'fnum':
-            i = fnum['end']
-            self.fram['fnum'] = fnum
+        if btrs:
+            self.btrs = self.__chunk_to_dict(btrs)
+            btdt_chunks = self.__collect_chunks_recursive(packet, btrs['payload_start'], btrs['payload_end'], 'btdt')
+        elif fram:
+            # 送信側実装差分で btrs が省略されるケースに対応（fram内探索）
+            self.btrs = {'size': 0, 'name': 'btrs', 'data': None, 'end': packet_len}
+            btdt_chunks = self.__collect_chunks_recursive(packet, fram['payload_start'], fram['payload_end'], 'btdt')
+        else:
+            self.btrs = {'size': 0, 'name': 'btrs', 'data': None, 'end': packet_len}
+            btdt_chunks = []
 
-        # fram > time
-        time = self.__parse(data, i, 'int')
-        if time['name'] == 'time':
-            i = time['end']
-            self.fram['time'] = time
-
-        # fram > uttm
-        uttm = self.__parse(data, i, 'int')
-        if uttm['name'] == 'uttm':
-            i = uttm['end']
-            self.fram['uttm'] = uttm
-
-        # # fram > tmcd
-        tmcd = self.__parse(data, i, 'int')
-        if tmcd['name'] == 'tmcd':
-            i = tmcd['end']
-            self.fram['tmcd'] = tmcd
-
-        # btrs
-        btrs = self.__parse(data, i)
-        i = btrs['end']
-
-        # btrs > btdt
         btdt_list = []
-        for _ in range(MocopiData.MAX_BONE):
-            bone = self.__btdt_parse(data, i)
-            i = bone['end']
-            btdt_list.append(bone)
+        for chunk in btdt_chunks:
+            bone = self.__parse_btdt(packet, chunk)
+            if bone:
+                btdt_list.append(bone)
 
-        self.btrs = btrs
+        if not btdt_list and skdf:
+                btdt_list = self.__parse_skdf_to_btdt(packet, skdf)
+                if btdt_list:
+                    self.packet_type = 'skeleton'
+
+        if not btdt_list:
+            top_names = ','.join(self.__list_chunk_names(packet, 0, packet_len))
+            raise ValueError(f'missing btdt chunk (top={top_names})')
+
+        if self.packet_type == 'unknown':
+            if has_frame_container:
+                self.packet_type = 'frame'
+            elif skdf:
+                self.packet_type = 'skeleton'
+            else:
+                top_names = ','.join(self.__list_chunk_names(packet, 0, packet_len))
+                raise ValueError(f'unknown packet type (top={top_names})')
+
         self.btrs['btdt'] = btdt_list
-        
-    def __parse(self, bytes: bytes, i: int, type: str = None) -> dict:
 
-        SIZE = 4
-
-        size = int.from_bytes(bytes[i:i+SIZE], 'little')
-        i += SIZE
-        name = bytes[i:i+SIZE].decode('ascii')
-        i += SIZE
-
-        data = None
-        if type == 'ascii':
-            data = bytes[i:i+size].decode('ascii')
-            i += size
-        elif type == 'int':
-            data = int.from_bytes(bytes[i:i+size], 'little')
-            i += size
-        elif type == 'vector':
-            data = struct.unpack('<7f', bytes[i:i+size])
-            i += size
-        elif type == 'raw':
-            data = bytes[i:i+size]
-            i += size
-        
+    def __chunk_to_dict(self, chunk: dict, data=None) -> dict:
         return {
-                'size': size, 
-                'name': name, 
-                'data': data, 
-                'end': i
-            }
-    
-    def __btdt_parse(self, bytes: bytes, i: int) -> dict:
+            'size': chunk['size'],
+            'name': chunk['name'],
+            'data': data,
+            'end': chunk['end'],
+        }
 
-        # btdt
-        btdt = self.__parse(bytes, i)
-        i = btdt['end']
+    def __read_chunk_header(self, packet: bytes, i: int, limit: int = None) -> dict:
+        if i + 8 > len(packet):
+            raise ValueError('invalid chunk header')
 
-        # btdt > bnid
-        bnid = self.__parse(bytes, i, 'int')
-        i = bnid['end']
+        size = int.from_bytes(packet[i:i+4], 'little')
+        try:
+            name = packet[i+4:i+8].decode('ascii')
+        except UnicodeDecodeError as e:
+            raise ValueError('invalid chunk name') from e
+        payload_start = i + 8
+        payload_end = payload_start + size
 
-        # btdt > tran
-        tran = self.__parse(bytes, i, 'vector')
-        i = tran['end']
+        boundary = len(packet) if limit is None else min(limit, len(packet))
+        if payload_end > boundary:
+            raise ValueError('chunk exceeds packet boundary')
 
-        btdt['bnid'] = bnid
-        btdt['tran'] = tran
-        btdt['end'] = i
+        return {
+            'size': size,
+            'name': name,
+            'start': i,
+            'payload_start': payload_start,
+            'payload_end': payload_end,
+            'end': payload_end,
+        }
 
-        return btdt    
+    def __iter_children(self, packet: bytes, start: int, end: int):
+        i = start
+        while i + 8 <= end:
+            chunk = self.__read_chunk_header(packet, i, end)
+            yield chunk
+            i = chunk['end']
+
+    def __list_chunk_names(self, packet: bytes, start: int, end: int) -> list[str]:
+        names = []
+        try:
+            for chunk in self.__iter_children(packet, start, end):
+                names.append(chunk['name'])
+        except ValueError:
+            pass
+        return names
+
+    def __collect_chunks_recursive(self, packet: bytes, start: int, end: int, name: str, depth: int = 0, max_depth: int = 5) -> list[dict]:
+        found = []
+        if depth > max_depth:
+            return found
+
+        try:
+            children = list(self.__iter_children(packet, start, end))
+        except ValueError:
+            return found
+
+        for chunk in children:
+            if chunk['name'] == name:
+                found.append(chunk)
+
+            # payloadがチャンク列でない場合は例外で自然に打ち切られる
+            if chunk['size'] >= 8:
+                found.extend(
+                    self.__collect_chunks_recursive(
+                        packet,
+                        chunk['payload_start'],
+                        chunk['payload_end'],
+                        name,
+                        depth + 1,
+                        max_depth,
+                    )
+                )
+
+        return found
+
+    def __find_child(self, packet: bytes, start: int, end: int, name: str):
+        for chunk in self.__iter_children(packet, start, end):
+            if chunk['name'] == name:
+                return chunk
+        return None
+
+    def __read_raw(self, packet: bytes, chunk: dict) -> bytes:
+        return packet[chunk['payload_start']:chunk['payload_end']]
+
+    def __read_ascii(self, packet: bytes, chunk: dict) -> str:
+        return self.__read_raw(packet, chunk).decode('ascii')
+
+    def __read_int(self, packet: bytes, chunk: dict) -> int:
+        payload = self.__read_raw(packet, chunk)
+        return int.from_bytes(payload, 'little') if payload else 0
+
+    def __read_vector7(self, packet: bytes, chunk: dict) -> tuple:
+        payload = self.__read_raw(packet, chunk)
+        if len(payload) < 28:
+            raise ValueError('tran chunk too short')
+        count = len(payload) // 4
+        values = struct.unpack('<' + ('f' * count), payload[:count * 4])
+        return values[:7]
+
+    def __parse_btdt(self, packet: bytes, btdt_chunk: dict):
+        bnid_chunk = self.__find_child(packet, btdt_chunk['payload_start'], btdt_chunk['payload_end'], 'bnid')
+        tran_chunk = self.__find_child(packet, btdt_chunk['payload_start'], btdt_chunk['payload_end'], 'tran')
+
+        if not bnid_chunk or not tran_chunk:
+            return None
+
+        return {
+            'size': btdt_chunk['size'],
+            'name': btdt_chunk['name'],
+            'bnid': self.__chunk_to_dict(bnid_chunk, self.__read_int(packet, bnid_chunk)),
+            'tran': self.__chunk_to_dict(tran_chunk, self.__read_vector7(packet, tran_chunk)),
+            'end': btdt_chunk['end'],
+        }
+
+    def __parse_skdf_to_btdt(self, packet: bytes, skdf_chunk: dict) -> list[dict]:
+        bones_container = self.__find_child(packet, skdf_chunk['payload_start'], skdf_chunk['payload_end'], 'bons')
+        if not bones_container:
+            return []
+
+        bndt_chunks = self.__collect_chunks_recursive(packet, bones_container['payload_start'], bones_container['payload_end'], 'bndt')
+        btdt_list = []
+        for bndt in bndt_chunks:
+            bnid_chunk = self.__find_child(packet, bndt['payload_start'], bndt['payload_end'], 'bnid')
+            tran_chunk = self.__find_child(packet, bndt['payload_start'], bndt['payload_end'], 'tran')
+            if not bnid_chunk or not tran_chunk:
+                continue
+
+            btdt_list.append({
+                'size': bndt['size'],
+                'name': 'btdt',
+                'bnid': self.__chunk_to_dict(bnid_chunk, self.__read_int(packet, bnid_chunk)),
+                'tran': self.__chunk_to_dict(tran_chunk, self.__read_vector7(packet, tran_chunk)),
+                'end': bndt['end'],
+            })
+
+        return btdt_list

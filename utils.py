@@ -30,6 +30,34 @@ def is_valid(obj) -> bool:
 def is_armature(obj: bpy.types.Object) -> bool:
     return is_valid(obj) and obj.type == 'ARMATURE'
 
+def resolve_armature(obj: bpy.types.Object) -> bpy.types.Object | None:
+    if is_armature(obj):
+        return obj
+    if not is_valid(obj):
+        return None
+
+    # 親階層を辿ってアーマチュアを探す
+    parent = obj.parent
+    while is_valid(parent):
+        if is_armature(parent):
+            return parent
+        parent = parent.parent
+
+    # Armatureモディファイアから参照されるアーマチュアを探す
+    for mod in getattr(obj, 'modifiers', []):
+        if getattr(mod, 'type', None) == 'ARMATURE' and is_armature(getattr(mod, 'object', None)):
+            return mod.object
+
+    # Blender組み込みの探索結果も利用する
+    try:
+        found = obj.find_armature()
+        if is_armature(found):
+            return found
+    except Exception:
+        pass
+
+    return None
+
 def get_ip_address():
         ip_address = '127.0.0.1'
         try:
@@ -44,6 +72,71 @@ def get_scale_value(obj: bpy.types.Object) -> float:
     if not is_valid(obj):
         return 1.0
     return (obj.scale.x + obj.scale.y + obj.scale.z) / 3.0
+
+def ensure_action_slot(anim_data: bpy.types.AnimData) -> None:
+    """
+    Blender 4.4+ の Slotted Actions 互換: action 割当後に slot が未設定なら明示設定する。
+    """
+    if not anim_data:
+        return
+
+    action = getattr(anim_data, 'action', None)
+    if not action:
+        return
+
+    # Blender 4.3 以前は action_slot が存在しない
+    if not hasattr(anim_data, 'action_slot'):
+        return
+
+    try:
+        if anim_data.action_slot:
+            return
+    except Exception:
+        return
+
+    # まず Blender 側の適合候補から割り当て
+    suitable_slots = getattr(anim_data, 'action_suitable_slots', None)
+    if suitable_slots:
+        try:
+            anim_data.action_slot = suitable_slots[0]
+            return
+        except Exception:
+            pass
+
+    # 候補がない場合は action 側に slot を作成して再割り当てを試す
+    slots = getattr(action, 'slots', None)
+    id_owner = getattr(anim_data, 'id_data', None)
+    if slots and id_owner and hasattr(id_owner, 'id_type'):
+        try:
+            slot = slots.new(id_type=id_owner.id_type, name=id_owner.name)
+            anim_data.action_slot = slot
+        except Exception:
+            pass
+
+def set_active_object(obj: bpy.types.Object) -> bool:
+    if not is_valid(obj):
+        return False
+    view_layer = getattr(bpy.context, 'view_layer', None)
+    if not view_layer:
+        return False
+    view_layer.objects.active = obj
+    return view_layer.objects.active == obj
+
+def ensure_object_mode(obj: bpy.types.Object, mode: str) -> bool:
+    """
+    指定オブジェクトをアクティブ化し、必要な場合のみ mode_set する。
+    Blenderの内部トグル連打を減らしてモード遷移を安定させる。
+    """
+    if not set_active_object(obj):
+        return False
+    current_mode = getattr(obj, 'mode', None)
+    if current_mode == mode:
+        return True
+    try:
+        bpy.ops.object.mode_set(mode=mode)
+    except Exception:
+        return False
+    return getattr(obj, 'mode', None) == mode
 
 def get_bone_name(bone: bpy.types.PoseBone) -> str:
     try:
@@ -163,100 +256,64 @@ def bone_id_to_bone_name(bone_id: int) -> str:
 def bake_animation(source_armature: bpy.types.Object, target_armature: bpy.types.Object, target_bone_name_list: list[str], frame_split: int = 25):
 
     frame_start, frame_end = read_anim_start_end(source_armature)
+    if frame_start is None or frame_end is None:
+        return
     frame_start, frame_end = int(frame_start), int(frame_end)
+    if frame_end < frame_start:
+        return
 
     bpy.ops.object.select_all(action='DESELECT')
     target_armature.select_set(True)
-    bpy.context.view_layer.objects.active = target_armature
-    bpy.ops.object.mode_set(mode='POSE')
+    if not ensure_object_mode(target_armature, 'POSE'):
+        return
 
-    target_action = target_armature.animation_data.action
-    target_armature.animation_data.action = None
+    target_anim_data = target_armature.animation_data_create()
+    if not target_anim_data.action:
+        target_anim_data.action = bpy.data.actions.new(name='mocopi_baked_action')
+    ensure_action_slot(target_anim_data)
 
-    split_ranges = list(range(frame_start, frame_end + 1, frame_split))
-    if split_ranges[-1] != frame_end:
-        split_ranges.append(frame_end)
-
-    MAX_STEP = len(split_ranges) - 1
     wm = bpy.context.window_manager
-    wm.progress_begin(0, MAX_STEP)
+    wm.progress_begin(0, 1)
+    try:
+        bpy.ops.nla.bake(
+            frame_start=frame_start,
+            frame_end=frame_end,
+            visual_keying=True,
+            only_selected=False,
+            use_current_action=True,
+            bake_types={'POSE'}
+        )
+        ensure_action_slot(target_anim_data)
+    finally:
+        wm.progress_end()
 
-    all_actions = {}
-    for step in range(MAX_STEP):
-
-        start = split_ranges[step]
-        end = split_ranges[step + 1]
-        bpy.ops.nla.bake(frame_start=start, frame_end=end, visual_keying=True, only_selected=False, use_current_action=False, bake_types={'POSE'} )
-
-        baked_action = target_armature.animation_data.action
-        baked_action.name = f"baked_{start}_{end}"
-        all_actions[(start, end)] = baked_action
-
-        wm.progress_update(step)
-
-    target_armature.animation_data.action = target_action
-    target_action.use_fake_user = True
-
-    for frame in range(frame_start, frame_end + 1):
-        bpy.context.scene.frame_set(frame)
-
-        current_action = None
-        for (start, end), action in all_actions.items():
-            if start <= frame <= end:
-                current_action = action
-                break
-        if current_action is None:
-            continue
-        
-        for bone_name in target_bone_name_list:
-            bone = target_armature.pose.bones.get(bone_name)
-            if not bone:
-                continue
-
-            is_hip = bone_name == target_bone_name_list[0]
-            if is_hip:
-                loc = [0.0, 0.0, 0.0]
-                for step in range(3):
-                    fcurve = current_action.fcurves.find(f'pose.bones["{bone_name}"].location', index=step)
-                    loc[step] = fcurve.evaluate(frame) if fcurve else loc[step]
-                # Rootの回転を考慮してローカル座標に変換
-                bone.location = Vector(loc) #target_armature.matrix_world.to_quaternion().inverted() @ Vector(loc)
-                bone.keyframe_insert(data_path="location", frame=frame, group=bone_name)
-
-            quat = [1.0, 0.0, 0.0, 0.0]
-            for step in range(4):
-                fcurve = current_action.fcurves.find(f'pose.bones["{bone_name}"].rotation_quaternion', index=step)
-                quat[step] = fcurve.evaluate(frame) if fcurve else quat[step]
-            bone.rotation_mode = 'QUATERNION'
-
-            if is_hip:
-                # Rootの回転を考慮してローカル回転に変換
-                bone.rotation_quaternion = Quaternion(quat)#target_armature.matrix_world.to_quaternion().inverted() @ Quaternion(quat)
-            else:
-                bone.rotation_quaternion = Quaternion(quat)
-
-            bone.keyframe_insert(data_path="rotation_quaternion", frame=frame, group=bone_name)
-
-    bpy.ops.object.mode_set(mode='OBJECT')
-
-    for action in all_actions.values():
-        bpy.data.actions.remove(action)
-
-    wm.progress_end()
+    ensure_object_mode(target_armature, 'OBJECT')
 
 def read_anim_start_end(armature: bpy.types.Object) -> tuple:
-    frame_start = None
-    frame_end = None
-    for fcurve in armature.animation_data.action.fcurves:
-        for key in fcurve.keyframe_points:
-            keyframe = key.co.x
-            if not frame_start:
-                frame_start = keyframe
-            if not frame_end:
-                frame_end = keyframe
+    anim_data = getattr(armature, 'animation_data', None)
+    action = getattr(anim_data, 'action', None)
+    if not action:
+        return None, None
 
-            if keyframe < frame_start:
-                frame_start = keyframe
-            if keyframe > frame_end:
-                frame_end = keyframe
-    return frame_start, frame_end
+    frame_range = getattr(action, 'frame_range', None)
+    if frame_range and len(frame_range) >= 2:
+        start = float(frame_range[0])
+        end = float(frame_range[1])
+        if end >= start:
+            return start, end
+
+    # 旧API互換のフォールバック
+    fcurves = getattr(action, 'fcurves', None)
+    if fcurves:
+        frame_start = None
+        frame_end = None
+        for fcurve in fcurves:
+            for key in fcurve.keyframe_points:
+                keyframe = key.co.x
+                if frame_start is None or keyframe < frame_start:
+                    frame_start = keyframe
+                if frame_end is None or keyframe > frame_end:
+                    frame_end = keyframe
+        return frame_start, frame_end
+
+    return None, None
