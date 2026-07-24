@@ -340,16 +340,15 @@ class MocopiProperty(bpy.types.PropertyGroup):
 
     @classmethod
     def unregister(cls):
-        bpy.app.translations.unregister(__name__)
         scene = bpy.types.Scene
         if hasattr(scene, "mocopi_property"):
             del scene.mocopi_property
 
     def get(self, id: int) -> MocopiAvatarProperty:
         if id == 1:
-            return bpy.context.scene.mocopi_property.avatar_1
+            return self.avatar_1
         elif id == 2:
-            return bpy.context.scene.mocopi_property.avatar_2
+            return self.avatar_2
         elif id == 3:
-            return bpy.context.scene.mocopi_property.avatar_3
+            return self.avatar_3
         return None

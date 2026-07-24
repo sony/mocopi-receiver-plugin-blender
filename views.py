@@ -77,6 +77,7 @@ class MOCOPI_RECEIVER_PT_AvatarPanel(bpy.types.Panel):
         # 更新のコールバック
         avatar = self.listener.on_drawed(self, context, self.id)
         prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(self.id)
+        resolved_rig = utils.resolve_armature(prop.rig) if utils.is_valid(prop) else None
 
         row = layout.row()
         row.label(text=strings.get('switch_mode') + ':')
@@ -93,7 +94,8 @@ class MOCOPI_RECEIVER_PT_AvatarPanel(bpy.types.Panel):
         op = row.operator(MOCOPI_RECEIVER_OT_AvatarPanel.bl_idname, text=strings.get('connect') if not avatar.running else strings.get('disconnect'))
         op.id = self.id
         op.action = 'connect_button'
-        row.enabled = utils.is_valid(prop) and utils.is_armature(avatar.rig)
+        # Character未設定時は接続開始を無効化する
+        row.enabled = utils.is_armature(resolved_rig)
 
         # row = layout.row()
         # row.label(text=strings.get('model_type') + ':')
@@ -118,34 +120,34 @@ class MOCOPI_RECEIVER_PT_AvatarPanel(bpy.types.Panel):
         box.enabled = not avatar.running
         
         # ボーン
-        if utils.is_valid(prop) and utils.is_armature(avatar.rig):
-            box.prop_search(prop, 'root', search_data=avatar.rig.data, search_property='bones', text='Hip')
-            box.prop_search(prop, 'torso_1', search_data=avatar.rig.data, search_property='bones', text='Torso1')
-            box.prop_search(prop, 'torso_2', search_data=avatar.rig.data, search_property='bones', text='Torso2')
-            box.prop_search(prop, 'torso_3', search_data=avatar.rig.data, search_property='bones', text='Torso3')
-            box.prop_search(prop, 'torso_4', search_data=avatar.rig.data, search_property='bones', text='Torso4')
-            box.prop_search(prop, 'torso_5', search_data=avatar.rig.data, search_property='bones', text='Torso5')
-            box.prop_search(prop, 'torso_6', search_data=avatar.rig.data, search_property='bones', text='Torso6')
-            box.prop_search(prop, 'torso_7', search_data=avatar.rig.data, search_property='bones', text='Torso7')
-            box.prop_search(prop, 'neck_1', search_data=avatar.rig.data, search_property='bones', text='Neck1')
-            box.prop_search(prop, 'neck_2', search_data=avatar.rig.data, search_property='bones', text='Neck2')
-            box.prop_search(prop, 'head', search_data=avatar.rig.data, search_property='bones', text='Head')
-            box.prop_search(prop, 'l_shoulder', search_data=avatar.rig.data, search_property='bones', text='L_Shoulder')
-            box.prop_search(prop, 'l_up_arm', search_data=avatar.rig.data, search_property='bones', text='L_UpperArm')
-            box.prop_search(prop, 'l_low_arm', search_data=avatar.rig.data, search_property='bones', text='L_LowerArm')
-            box.prop_search(prop, 'l_hand', search_data=avatar.rig.data, search_property='bones', text='L_Hand')
-            box.prop_search(prop, 'r_shoulder', search_data=avatar.rig.data, search_property='bones', text='R_Shoulder')
-            box.prop_search(prop, 'r_up_arm', search_data=avatar.rig.data, search_property='bones', text='R_UpperArm')
-            box.prop_search(prop, 'r_low_arm', search_data=avatar.rig.data, search_property='bones', text='R_LowerArm')
-            box.prop_search(prop, 'r_hand', search_data=avatar.rig.data, search_property='bones', text='R_Hand')
-            box.prop_search(prop, 'l_up_leg', search_data=avatar.rig.data, search_property='bones', text='L_UpperLeg')
-            box.prop_search(prop, 'l_low_leg', search_data=avatar.rig.data, search_property='bones', text='L_LowerLeg')
-            box.prop_search(prop, 'l_foot', search_data=avatar.rig.data, search_property='bones', text='L_Foot')
-            box.prop_search(prop, 'l_toes', search_data=avatar.rig.data, search_property='bones', text='L_ToeBase')
-            box.prop_search(prop, 'r_up_leg', search_data=avatar.rig.data, search_property='bones', text='R_UpperLeg')
-            box.prop_search(prop, 'r_low_leg', search_data=avatar.rig.data, search_property='bones', text='R_LowerLeg')
-            box.prop_search(prop, 'r_foot', search_data=avatar.rig.data, search_property='bones', text='R_Foot')
-            box.prop_search(prop, 'r_toes', search_data=avatar.rig.data, search_property='bones', text='R_ToeBase')
+        if utils.is_valid(prop) and utils.is_armature(resolved_rig):
+            box.prop_search(prop, 'root', search_data=resolved_rig.data, search_property='bones', text='Hip')
+            box.prop_search(prop, 'torso_1', search_data=resolved_rig.data, search_property='bones', text='Torso1')
+            box.prop_search(prop, 'torso_2', search_data=resolved_rig.data, search_property='bones', text='Torso2')
+            box.prop_search(prop, 'torso_3', search_data=resolved_rig.data, search_property='bones', text='Torso3')
+            box.prop_search(prop, 'torso_4', search_data=resolved_rig.data, search_property='bones', text='Torso4')
+            box.prop_search(prop, 'torso_5', search_data=resolved_rig.data, search_property='bones', text='Torso5')
+            box.prop_search(prop, 'torso_6', search_data=resolved_rig.data, search_property='bones', text='Torso6')
+            box.prop_search(prop, 'torso_7', search_data=resolved_rig.data, search_property='bones', text='Torso7')
+            box.prop_search(prop, 'neck_1', search_data=resolved_rig.data, search_property='bones', text='Neck1')
+            box.prop_search(prop, 'neck_2', search_data=resolved_rig.data, search_property='bones', text='Neck2')
+            box.prop_search(prop, 'head', search_data=resolved_rig.data, search_property='bones', text='Head')
+            box.prop_search(prop, 'l_shoulder', search_data=resolved_rig.data, search_property='bones', text='L_Shoulder')
+            box.prop_search(prop, 'l_up_arm', search_data=resolved_rig.data, search_property='bones', text='L_UpperArm')
+            box.prop_search(prop, 'l_low_arm', search_data=resolved_rig.data, search_property='bones', text='L_LowerArm')
+            box.prop_search(prop, 'l_hand', search_data=resolved_rig.data, search_property='bones', text='L_Hand')
+            box.prop_search(prop, 'r_shoulder', search_data=resolved_rig.data, search_property='bones', text='R_Shoulder')
+            box.prop_search(prop, 'r_up_arm', search_data=resolved_rig.data, search_property='bones', text='R_UpperArm')
+            box.prop_search(prop, 'r_low_arm', search_data=resolved_rig.data, search_property='bones', text='R_LowerArm')
+            box.prop_search(prop, 'r_hand', search_data=resolved_rig.data, search_property='bones', text='R_Hand')
+            box.prop_search(prop, 'l_up_leg', search_data=resolved_rig.data, search_property='bones', text='L_UpperLeg')
+            box.prop_search(prop, 'l_low_leg', search_data=resolved_rig.data, search_property='bones', text='L_LowerLeg')
+            box.prop_search(prop, 'l_foot', search_data=resolved_rig.data, search_property='bones', text='L_Foot')
+            box.prop_search(prop, 'l_toes', search_data=resolved_rig.data, search_property='bones', text='L_ToeBase')
+            box.prop_search(prop, 'r_up_leg', search_data=resolved_rig.data, search_property='bones', text='R_UpperLeg')
+            box.prop_search(prop, 'r_low_leg', search_data=resolved_rig.data, search_property='bones', text='R_LowerLeg')
+            box.prop_search(prop, 'r_foot', search_data=resolved_rig.data, search_property='bones', text='R_Foot')
+            box.prop_search(prop, 'r_toes', search_data=resolved_rig.data, search_property='bones', text='R_ToeBase')
 
 
 class MOCOPI_RECEIVER_PT_Panel(bpy.types.Panel):

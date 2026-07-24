@@ -16,6 +16,7 @@
 import bpy
 import bpy.utils.previews
 import os
+import traceback
 from . import views
 from . import models
 from . import properties
@@ -67,7 +68,7 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
     avatars: list[models.Avatar] = []
 
     def __init__(self):
-        pass
+        self._timer_callback = self.__update
 
     # Public
 
@@ -93,17 +94,24 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
         properties.MocopiProperty.register()
 
         # アバター
+        self.avatars.clear()
         self.avatars.append(models.Avatar(1, Main.classes[5]))
         self.avatars.append(models.Avatar(2, Main.classes[6]))
         self.avatars.append(models.Avatar(3, Main.classes[7]))
 
         # 定期処理
-        bpy.app.timers.register(self.__update, persistent=False)
+        self.__ensure_timer_registered()
 
     def unregister(self):
 
-        # # 定期処理
-        # bpy.app.timers.unregister(self.__update)
+        # 定期処理
+        if bpy.app.timers.is_registered(self._timer_callback):
+            bpy.app.timers.unregister(self._timer_callback)
+
+        # mocopi切断
+        for avatar in self.avatars:
+            avatar.stop()
+        self.avatars.clear()
 
         # プロパティ
         properties.MocopiProperty.unregister()
@@ -128,8 +136,9 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
         
         # オートリターゲット
         prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(id)
-        prop.auto_retarget(rig)
-        avatar.retarget(rig, prop)
+        resolved_rig = utils.resolve_armature(rig)
+        prop.auto_retarget(resolved_rig)
+        avatar.retarget(resolved_rig, prop)
 
     def on_bone_updated(self, context: bpy.types.Context, id: int, rig: str):
         
@@ -139,6 +148,8 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
         
         # リターゲット
         prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(id)
+        if avatar.running and utils.is_valid(prop) and prop.mode == 'v2':
+            return
         avatar.retarget(avatar.rig, prop)
 
     def on_debug_id_updated(self, context: bpy.types.Context, id: int, debug_id: int):
@@ -162,23 +173,54 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
         avatar = self.__find_avatar(id)
         if not avatar:
             return None
-        
-        if avatar.running and not utils.is_armature(avatar.rig):
-            avatar.stop()
+
+        # .blend再ロード後の参照切れ対策として毎描画で参照を再同期する
+        resolved_rig = utils.resolve_armature(prop.rig)
+        if avatar.running and prop.mode == 'v2':
+            return avatar
+
+        # 実行中は一時的な参照不整合で None 上書きしない
+        if utils.is_armature(resolved_rig):
+            avatar.retarget(resolved_rig, prop)
+        elif not avatar.running:
+            avatar.retarget(None, prop)
 
         return avatar
 
     def on_connect_button_clicked(self, op: views.MOCOPI_RECEIVER_OT_AvatarPanel, context: bpy.types.Context, id: int):
 
+        # 接続前に更新タイマーを再保証（再ロード後や例外後の停止対策）
+        self.__ensure_timer_registered()
+
         avatar = self.__find_avatar(id)
+        if not avatar:
+            return
+
         prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(id)
+        if not utils.is_valid(prop):
+            op.report({'WARNING'}, 'mocopi property is not initialized.')
+            return
+
+        # 接続開始時にプロパティ上のrigをアーマチュアとして再同期
+        resolved_rig = utils.resolve_armature(prop.rig)
+        if resolved_rig != prop.rig and utils.is_armature(resolved_rig):
+            prop.rig = resolved_rig
+        avatar.retarget(resolved_rig, prop)
+
+        # どのモードでも接続開始時にターゲットアーマチュアは必須
+        if not avatar.running and not utils.is_armature(avatar.rig):
+            op.report({'WARNING'}, strings.get('msg_target_is_not_armature'))
+            return
+
         if not avatar.running:
+
+            if hasattr(bpy.app, 'online_access') and not bpy.app.online_access:
+                op.report({'WARNING'}, 'Blender Online Access is disabled. Enable it for mocopi UDP receive.')
+                return
 
             # mocopi接続
             if prop.mode == 'v1':
-
-                if not utils.is_valid(prop) or not utils.is_armature(avatar.rig):
-                    op.report({'WARNING'}, strings.get('msg_target_is_not_armature'))
+                if not utils.is_valid(prop):
                     return
                 
                 avatar.retarget(avatar.rig, prop)
@@ -215,7 +257,8 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
         
         if avatar.is_recording:
             avatar.stop_recording()
-            if bpy.context.screen.is_animation_playing:
+            screen = bpy.context.screen
+            if screen and screen.is_animation_playing:
                 self.__stop_keyframe() # キーフレーム停止
 
                 avatar.stop()
@@ -227,27 +270,51 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
     # Private
 
     def __update(self):
+        try:
+            context = bpy.context
+            if not context or not context.scene:
+                return 0.1
 
-        if bpy.context.selected_objects:
-            self.__stop_keyframe() # キーフレーム停止
-            return 0
-        
-        for avatar in self.avatars:
-            avatar.update()
-            if avatar.running and not utils.is_armature(avatar.rig):
-                avatar.stop()
-                self.__stop_keyframe() # キーフレーム停止
+            scene = context.scene
+            mocopi_prop = getattr(scene, 'mocopi_property', None)
 
-        # if any(avatar.running for avatar in self.avatars) and not bpy.context.screen.is_animation_playing:
-        #     self.__start_keyframe() # キーフレーム再生
-        return 0
+            for avatar in self.avatars:
+                if mocopi_prop:
+                    prop = mocopi_prop.get(avatar.id)
+                    if utils.is_valid(prop):
+                        resolved_rig = utils.resolve_armature(prop.rig)
+                        if avatar.running and prop.mode == 'v2':
+                            avatar.update()
+                            continue
+
+                        # 実行中は有効な参照を None で潰さない
+                        if utils.is_armature(resolved_rig) and resolved_rig != avatar.rig:
+                            avatar.retarget(resolved_rig, prop)
+                        elif (not avatar.running) and resolved_rig != avatar.rig:
+                            avatar.retarget(resolved_rig, prop)
+
+                avatar.update()
+
+            # if any(avatar.running for avatar in self.avatars) and not bpy.context.screen.is_animation_playing:
+            #     self.__start_keyframe() # キーフレーム再生
+            return 0.01
+        except Exception:
+            # タイマー例外でコールバックが消えるのを避ける
+            traceback.print_exc()
+            return 0.1
+
+    def __ensure_timer_registered(self):
+        if not bpy.app.timers.is_registered(self._timer_callback):
+            bpy.app.timers.register(self._timer_callback, persistent=True)
 
     def __start_keyframe(self):
-        if not bpy.context.screen.is_animation_playing:
+        screen = bpy.context.screen
+        if screen and not screen.is_animation_playing:
             bpy.ops.screen.animation_play()
 
     def __stop_keyframe(self):
-        if bpy.context.screen.is_animation_playing:
+        screen = bpy.context.screen
+        if screen and screen.is_animation_playing:
             bpy.ops.screen.animation_play()
 
     def __find_avatar(self, id: int) -> models.Avatar:

@@ -20,7 +20,7 @@ bl_info = {
     "author": "Sony Corporation",
     "description": "mocopiと連携してアニメーションを記録します。",
     "blender": (4, 2, 5),
-    "version": (1, 0, 0),
+    "version": (2, 3, 0),
     "location": "3Dビューポート > メニュー",
     "warning": "",
     "support": "COMMUNITY", # COMMUNITY, TESTING

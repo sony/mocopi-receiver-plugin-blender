@@ -3,7 +3,7 @@ schema_version = "1.0.0"
 # Example of manifest file for a Blender extension
 # Change the values according to your extension
 id = "mocopi_receiver"
-version = "2.2.0"
+version = "2.3.0"
 name = "mocopi Receiver"
 tagline = "Real-time motion capture plugin for mocopi devices"
 maintainer = "Sony Corporation"
@@ -58,10 +58,9 @@ license = [
 # Keep this a single short sentence without a period (.) at the end.
 # For longer explanations use the documentation or detail page.
 #
-# [permissions]
-# network = "Need to sync motion-capture data to server"
-# files = "Import/export FBX from/to disk"
-# clipboard = "Copy and paste bone transforms"
+[permissions]
+network = "Receive mocopi motion packets over UDP"
+files = "Import bundled FBX skeleton for retargeting"
 
 # Optional: build settings.
 # https://docs.blender.org/manual/en/dev/advanced/extensions/command_line_arguments.html#command-line-args-extension-build
