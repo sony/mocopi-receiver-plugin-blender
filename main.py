@@ -197,6 +197,7 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
             return
 
         prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(id)
+
         if not utils.is_valid(prop):
             op.report({'WARNING'}, 'mocopi property is not initialized.')
             return
@@ -205,9 +206,11 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
         resolved_rig = utils.resolve_armature(prop.rig)
         if resolved_rig != prop.rig and utils.is_armature(resolved_rig):
             prop.rig = resolved_rig
+
         avatar.retarget(resolved_rig, prop)
 
         # どのモードでも接続開始時にターゲットアーマチュアは必須
+        # Abort if the target armature is not valid
         if not avatar.running and not utils.is_armature(avatar.rig):
             op.report({'WARNING'}, strings.get('msg_target_is_not_armature'))
             return
@@ -219,27 +222,12 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
                 return
 
             # mocopi接続
-            if prop.mode == 'v1':
-                if not utils.is_valid(prop):
-                    return
-                
-                avatar.retarget(avatar.rig, prop)
-                avatar.run()
+            avatar.run()
 
-                if not avatar.running:
-                    op.report({'WARNING'}, strings.get('msg_confirm_port'))
-                    return
-
-                # 記録開始
-                self.__start_keyframe() # キーフレーム再生
-
-            elif prop.mode == 'v2':
-
-                avatar.run()
-
-                if not avatar.running:
-                    op.report({'WARNING'}, strings.get('msg_confirm_port'))
-                    return
+            # avatar.run() reports failure (port already in use, invalid rig) by leaving running False
+            if not avatar.running:
+                op.report({'WARNING'}, strings.get('msg_confirm_port'))
+                return
 
         else: 
 
@@ -254,18 +242,30 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
         avatar = self.__find_avatar(id)
         if not avatar:
             return
-        
+
+        # prop: used to access the settings and rig associated with this avatar
+        prop: properties.MocopiAvatarProperty = bpy.context.scene.mocopi_property.get(id)
+
         if avatar.is_recording:
             avatar.stop_recording()
             screen = bpy.context.screen
-            if screen and screen.is_animation_playing:
+
+            # capture playback state first; __stop_keyframe() clears is_animation_playing
+            was_playing = bool(screen and screen.is_animation_playing)
+
+            # ensure keyframe stopped only when animation is actively playing
+            if was_playing:
                 self.__stop_keyframe() # キーフレーム停止
 
+            # for v2, rebuild hidden skeleton/retarget constraints
+            if was_playing and utils.is_valid(prop) and prop.mode == 'v2':
                 avatar.stop()
                 avatar.run()
+
+        elif avatar.is_counting_down:
+            avatar.cancel_recording_countdown()
         else:
-            avatar.start_recording()
-            self.__start_keyframe() # キーフレーム再生
+            avatar.begin_recording_countdown(3.0)
 
     # Private
 
@@ -285,6 +285,9 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
                         resolved_rig = utils.resolve_armature(prop.rig)
                         if avatar.running and prop.mode == 'v2':
                             avatar.update()
+                            if avatar.just_started_recording:
+                                self.__start_keyframe() # start keyframe recording
+                                avatar.just_started_recording = False
                             continue
 
                         # 実行中は有効な参照を None で潰さない
@@ -294,6 +297,10 @@ class Main(properties.IMocopiAvatarPropertyListener, views.IAvatarPanelListener)
                             avatar.retarget(resolved_rig, prop)
 
                 avatar.update()
+
+                if avatar.just_started_recording:
+                    self.__start_keyframe()
+                    avatar.just_started_recording = False
 
             # if any(avatar.running for avatar in self.avatars) and not bpy.context.screen.is_animation_playing:
             #     self.__start_keyframe() # キーフレーム再生

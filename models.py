@@ -64,6 +64,12 @@ class Avatar:
         self.is_recording: bool = False
         self.retarget_base_rotation: Quaternion = Quaternion((1.0, 0.0, 0.0, 0.0))
 
+        # manage countdown state before recording starts
+        self.is_counting_down: bool = False
+        self.countdown_remaining: float = 0.0
+        self._countdown_last_tick: float = None
+        self.just_started_recording: bool = False
+
         self.debug_id: int = 0
 
     # Public
@@ -91,7 +97,10 @@ class Avatar:
         prop: properties.MocopiAvatarProperty = scene.mocopi_property.get(self.id)
         if not utils.is_valid(prop) or not utils.is_valid(self.rig):
             return
-        
+
+        #  if the recording countdown is active, update it
+        self.__tick_recording_countdown()
+
         # アクション
         if self.is_recording and (not self.rig.animation_data or not self.rig.animation_data.action):
             action_data = self.rig.animation_data_create()
@@ -156,7 +165,7 @@ class Avatar:
 
         if prop.mode == 'v1':
 
-            self.is_recording = True
+            self.is_recording = False
             self.rig_scale = self.__get_scale_armature(self.rig) / utils.get_scale_value(self.rig)
 
             # bpy.context.view_layer.objects.active = self.rig
@@ -218,6 +227,43 @@ class Avatar:
             self.skeleton = None
 
         self.is_recording = False
+        self.is_counting_down = False
+        self.countdown_remaining = 0.0
+        self._countdown_last_tick = None
+        self.just_started_recording = False
+
+    def begin_recording_countdown(self, seconds: float = 3.0):
+        self.is_counting_down = True
+        self.countdown_remaining = seconds
+        self._countdown_last_tick = time.time()
+
+    def cancel_recording_countdown(self):
+        self.is_counting_down = False
+        self.countdown_remaining = 0.0
+        self._countdown_last_tick = None
+
+    def __tick_recording_countdown(self):
+        # update(tick) the recording countdown, and start recording if it reaches 0
+        if not self.is_counting_down:
+            return
+
+        now = time.time()
+
+        # calculate the time delta since the last tick
+        if self._countdown_last_tick:
+            elapsed = now - self._countdown_last_tick
+        else:
+            elapsed = 0.0 # if this is the first tick, assume no time has passed
+
+        self._countdown_last_tick = now
+        self.countdown_remaining -= elapsed
+
+        if self.countdown_remaining > 0:
+            return
+
+        self.cancel_recording_countdown()
+        self.start_recording()
+        self.just_started_recording = True
 
     def start_recording(self):
         self.is_recording = True
@@ -231,7 +277,10 @@ class Avatar:
             return
 
         prop: properties.MocopiAvatarProperty = scene.mocopi_property.get(self.id)
-        self.__bake_animation(prop, self.skeleton, self.rig)
+        
+        # v1 records directly to target rig, so only baking necessary with v2
+        if utils.is_valid(prop) and prop.mode == 'v2':
+            self.__bake_animation(prop, self.skeleton, self.rig)
 
     def has_animation(self):
         return utils.is_armature(self.rig) and self.rig.animation_data and self.rig.animation_data.action

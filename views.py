@@ -14,6 +14,7 @@
 # limitations under the License.
 ###
 import bpy
+import math
 from abc import ABCMeta, abstractmethod
 from . import main
 from . import models
@@ -105,13 +106,22 @@ class MOCOPI_RECEIVER_PT_AvatarPanel(bpy.types.Panel):
         # row.label(text='debug: ')
         # row.prop(prop, 'debug_id', text='')
 
-        if prop.mode == 'v2':
-            row = layout.row()
-            row.label(text='')
-            op = row.operator(MOCOPI_RECEIVER_OT_AvatarPanel.bl_idname, text=strings.get('start_recording') if not avatar.is_recording else strings.get('stop_recording'))
-            op.id = self.id
-            op.action = 'recording_button'
-            row.enabled = avatar.running
+        row = layout.row()
+        
+        # populate the recording button with either "start recording", "stop recording", 
+        # or "recording starting in X seconds" depending on the avatar's state
+        row.label(text='')
+        if avatar.is_counting_down:
+            label = strings.get('recording_starting_in').format(math.ceil(avatar.countdown_remaining))
+        elif avatar.is_recording:
+            label = strings.get('stop_recording')
+        else:
+            label = strings.get('start_recording')
+
+        op = row.operator(MOCOPI_RECEIVER_OT_AvatarPanel.bl_idname, text=label)
+        op.id = self.id
+        op.action = 'recording_button'
+        row.enabled = avatar.running
 
         # ターゲット
         box = layout.box() 
