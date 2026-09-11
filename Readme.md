@@ -63,6 +63,15 @@ The add-on supports various armature naming conventions including:
 - VRM/VRoid bone structures
 - Custom bone naming patterns
 
+## Legacy vs. Generic Mode
+
+Each mocopi receiver has a mode dropdown: **Legacy** or **Generic**, controlling how motion data is applied. In code this is referred to as V1 (legacy) and V2 (generic).
+
+- **Legacy**: Writes motion directly to your armature as it arrives. Simplest and lowest-latency, but best for rigs already close to the mocopi skeleton's proportions/orientation. Recording starts as soon as you connect.
+- **Generic**: Applies motion to a hidden reference skeleton, then retargets it onto your armature. Use **Start/Stop Recording** to capture. Motion is baked onto your armature after stopping. Handles proportion/naming differences better, so it suits custom, Mixamo, or VRM/VRoid rigs.
+
+Start with **Generic** for most custom rigs.  Use **Legacy** for rigs that closely match the mocopi skeleton or for the simplest real-time path.
+
 ## Technical Details
 
 ### Network Protocol
